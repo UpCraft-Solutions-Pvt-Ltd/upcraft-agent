@@ -1,3 +1,5 @@
+//go:build legacy
+
 // PicoClaw - Ultra-lightweight personal AI agent
 // DingTalk channel implementation using Stream Mode
 

@@ -1,3 +1,5 @@
+//go:build legacy
+
 // Package constants provides shared constants across the codebase.
 package constants
 

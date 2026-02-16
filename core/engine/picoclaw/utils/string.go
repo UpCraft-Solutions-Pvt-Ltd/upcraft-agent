@@ -1,3 +1,5 @@
+//go:build legacy
+
 package utils
 
 // Truncate returns a truncated version of s with at most maxLen runes.

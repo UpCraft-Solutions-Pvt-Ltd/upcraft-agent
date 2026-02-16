@@ -1,4 +1,4 @@
-//go:build integration
+//go:build legacy && integration
 
 package providers
 
@@ -124,3 +124,4 @@ func TestIntegration_RealClaudeCLI_ParsesRealJSON(t *testing.T) {
 
 	t.Logf("Parsed: content=%q, finish=%s, usage=%+v", resp.Content, resp.FinishReason, resp.Usage)
 }
+
