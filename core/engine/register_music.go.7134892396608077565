@@ -1,0 +1,85 @@
+package engine
+
+import (
+	"context"
+	"fmt"
+
+	"upcraft-agent/core/skills"
+)
+
+func RegisterMusicPlayer(registry *Registry, player skills.MusicPlayer) error {
+	if registry == nil {
+		return fmt.Errorf("registry is required")
+	}
+	if player == nil {
+		return fmt.Errorf("music player implementation is required")
+	}
+
+	entries := []RegisteredAction{
+		{
+			Skill:       "MusicPlayer",
+			Action:      "Play",
+			Description: "Play music by user query string",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"query": map[string]interface{}{"type": "string"},
+				},
+				"required": []string{"query"},
+			},
+			Handler: func(ctx context.Context, input map[string]interface{}) *ActionResult {
+				query, _ := input["query"].(string)
+				if query == "" {
+					return ErrorResult("missing required field: query", fmt.Errorf("query is required"))
+				}
+				if err := player.Play(ctx, query); err != nil {
+					return ErrorResult("MusicPlayer.Play failed", err)
+				}
+				return SuccessResult("MusicPlayer.Play executed", "Playing: "+query)
+			},
+		},
+		{
+			Skill:       "MusicPlayer",
+			Action:      "Pause",
+			Description: "Pause current playback",
+			InputSchema: map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+			Handler: func(ctx context.Context, input map[string]interface{}) *ActionResult {
+				if err := player.Pause(ctx); err != nil {
+					return ErrorResult("MusicPlayer.Pause failed", err)
+				}
+				return SuccessResult("MusicPlayer.Pause executed", "Playback paused")
+			},
+		},
+		{
+			Skill:       "MusicPlayer",
+			Action:      "Resume",
+			Description: "Resume current playback",
+			InputSchema: map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+			Handler: func(ctx context.Context, input map[string]interface{}) *ActionResult {
+				if err := player.Resume(ctx); err != nil {
+					return ErrorResult("MusicPlayer.Resume failed", err)
+				}
+				return SuccessResult("MusicPlayer.Resume executed", "Playback resumed")
+			},
+		},
+		{
+			Skill:       "MusicPlayer",
+			Action:      "Next",
+			Description: "Skip to next track",
+			InputSchema: map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+			Handler: func(ctx context.Context, input map[string]interface{}) *ActionResult {
+				if err := player.Next(ctx); err != nil {
+					return ErrorResult("MusicPlayer.Next failed", err)
+				}
+				return SuccessResult("MusicPlayer.Next executed", "Skipped to next track")
+			},
+		},
+	}
+
+	for _, e := range entries {
+		if err := registry.Register(e); err != nil {
+			return err
+		}
+	}
+	return nil
+}

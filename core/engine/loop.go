@@ -1,0 +1,125 @@
+package engine
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/UpCraft-Solutions-Pvt-Ltd/upcraft-agent/core/skills"
+)
+
+// Instruction is the strictly-typed model output contract.
+type Instruction struct {
+	Tool     string                 `json:"tool"`
+	Action   string                 `json:"action"`
+	Input    map[string]interface{} `json:"input,omitempty"`
+	Query    string                 `json:"query,omitempty"`
+	URL      string                 `json:"url,omitempty"`
+	Response string                 `json:"response,omitempty"`
+	Done     bool                   `json:"done,omitempty"`
+}
+
+// LoopConfig configures the deterministic reason+act loop.
+type LoopConfig struct {
+	Provider      LLMProvider
+	Model         string
+	Registry      *Registry
+	MaxIterations int
+	LLMOptions    map[string]interface{}
+}
+
+func RunDeterministicLoop(ctx context.Context, cfg LoopConfig, userPrompt string, defs []skills.SkillDefinition) (string, error) {
+	if cfg.Provider == nil {
+		return "", fmt.Errorf("provider is required")
+	}
+	if cfg.Registry == nil {
+		return "", fmt.Errorf("registry is required")
+	}
+	if strings.TrimSpace(cfg.Model) == "" {
+		cfg.Model = cfg.Provider.GetDefaultModel()
+	}
+	if cfg.MaxIterations <= 0 {
+		cfg.MaxIterations = 8
+	}
+	if cfg.LLMOptions == nil {
+		cfg.LLMOptions = map[string]interface{}{"temperature": 0.1, "max_tokens": 700}
+	}
+
+	skillDefsJSON, err := json.Marshal(defs)
+	if err != nil {
+		return "", fmt.Errorf("marshal skill definitions: %w", err)
+	}
+
+	systemPrompt := "You are UpCraft deterministic planner. Output JSON only with no markdown. " +
+		"When tool execution is needed, return: {\"tool\":\"<SkillName>\",\"action\":\"<ActionName>\",\"input\":{...}}. " +
+		"When task is complete, return: {\"response\":\"<final user response>\",\"done\":true}. " +
+		"Available skills: " + string(skillDefsJSON)
+
+	messages := []Message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userPrompt},
+	}
+
+	for i := 0; i < cfg.MaxIterations; i++ {
+		resp, err := cfg.Provider.Chat(ctx, messages, nil, cfg.Model, cfg.LLMOptions)
+		if err != nil {
+			return "", fmt.Errorf("provider chat failed at iteration %d: %w", i+1, err)
+		}
+
+		instr, err := parseInstruction(resp.Content)
+		if err != nil {
+			return "", fmt.Errorf("invalid instruction JSON at iteration %d: %w", i+1, err)
+		}
+
+		messages = append(messages, Message{Role: "assistant", Content: resp.Content})
+
+		if instr.Done || (instr.Response != "" && instr.Tool == "" && instr.Action == "") {
+			if strings.TrimSpace(instr.Response) == "" {
+				return "", fmt.Errorf("done=true but response is empty")
+			}
+			return instr.Response, nil
+		}
+
+		if strings.TrimSpace(instr.Tool) == "" || strings.TrimSpace(instr.Action) == "" {
+			return "", fmt.Errorf("instruction missing tool/action")
+		}
+
+		input := instr.Input
+		if input == nil {
+			input = map[string]interface{}{}
+		}
+		if instr.Query != "" {
+			input["query"] = instr.Query
+		}
+		if instr.URL != "" {
+			input["url"] = instr.URL
+		}
+
+		result := cfg.Registry.Execute(ctx, instr.Tool, instr.Action, input)
+		toolPayload := result.ForModel
+		if result.IsError && result.Err != nil {
+			toolPayload = toolPayload + " | error=" + result.Err.Error()
+		}
+		messages = append(messages, Message{Role: "tool", Content: toolPayload, ToolCallID: fmt.Sprintf("iter-%d", i+1)})
+	}
+
+	return "", fmt.Errorf("max iterations reached (%d)", cfg.MaxIterations)
+}
+
+func parseInstruction(raw string) (*Instruction, error) {
+	trimmed := strings.TrimSpace(raw)
+	trimmed = strings.TrimPrefix(trimmed, "```json")
+	trimmed = strings.TrimPrefix(trimmed, "```")
+	trimmed = strings.TrimSuffix(trimmed, "```")
+	trimmed = strings.TrimSpace(trimmed)
+
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.DisallowUnknownFields()
+
+	var instr Instruction
+	if err := dec.Decode(&instr); err != nil {
+		return nil, err
+	}
+	return &instr, nil
+}

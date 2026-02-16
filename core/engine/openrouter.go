@@ -1,0 +1,166 @@
+package engine
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+)
+
+const (
+	OpenRouterBaseURL    = "https://openrouter.ai/api/v1"
+	DefaultFreeModel     = "meta-llama/llama-3.2-3b-instruct:free"
+	OpenRouterAPIKeyEnv  = "OPENROUTER_API_KEY"
+	OpenRouterModelEnv   = "OPENROUTER_MODEL"
+	OpenRouterRefererEnv = "UPCRAFT_ORIGIN"
+	OpenRouterTitleEnv   = "UPCRAFT_TITLE"
+	defaultClientTimeout = 90 * time.Second
+)
+
+type OpenRouterProvider struct {
+	apiKey       string
+	apiBase      string
+	defaultModel string
+	httpClient   *http.Client
+}
+
+func NewOpenRouterProviderFromEnv() (*OpenRouterProvider, error) {
+	apiKey := strings.TrimSpace(os.Getenv(OpenRouterAPIKeyEnv))
+	if apiKey == "" {
+		return nil, fmt.Errorf("%s is required", OpenRouterAPIKeyEnv)
+	}
+	model := strings.TrimSpace(os.Getenv(OpenRouterModelEnv))
+	if model == "" {
+		model = DefaultFreeModel
+	}
+
+	return &OpenRouterProvider{
+		apiKey:       apiKey,
+		apiBase:      OpenRouterBaseURL,
+		defaultModel: model,
+		httpClient:   &http.Client{Timeout: defaultClientTimeout},
+	}, nil
+}
+
+func (p *OpenRouterProvider) GetDefaultModel() string {
+	return p.defaultModel
+}
+
+func (p *OpenRouterProvider) Chat(ctx context.Context, messages []Message, tools []ToolDefinition, model string, options map[string]interface{}) (*LLMResponse, error) {
+	if strings.TrimSpace(model) == "" {
+		model = p.defaultModel
+	}
+
+	requestBody := map[string]interface{}{
+		"model":    model,
+		"messages": messages,
+	}
+	if len(tools) > 0 {
+		requestBody["tools"] = tools
+		requestBody["tool_choice"] = "auto"
+	}
+	for k, v := range options {
+		requestBody[k] = v
+	}
+
+	body, err := json.Marshal(requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.apiBase+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+p.apiKey)
+
+	if referer := strings.TrimSpace(os.Getenv(OpenRouterRefererEnv)); referer != "" {
+		req.Header.Set("HTTP-Referer", referer)
+	}
+	if title := strings.TrimSpace(os.Getenv(OpenRouterTitleEnv)); title != "" {
+		req.Header.Set("X-Title", title)
+	}
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("openrouter status=%d body=%s", resp.StatusCode, string(respBody))
+	}
+
+	return parseOpenRouterResponse(respBody)
+}
+
+func parseOpenRouterResponse(raw []byte) (*LLMResponse, error) {
+	var apiResponse struct {
+		Choices []struct {
+			Message struct {
+				Content   interface{} `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function *struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage *UsageInfo `json:"usage"`
+	}
+
+	if err := json.Unmarshal(raw, &apiResponse); err != nil {
+		return nil, fmt.Errorf("unmarshal provider response: %w", err)
+	}
+	if len(apiResponse.Choices) == 0 {
+		return &LLMResponse{FinishReason: "stop"}, nil
+	}
+
+	choice := apiResponse.Choices[0]
+	content := ""
+	switch v := choice.Message.Content.(type) {
+	case string:
+		content = v
+	case nil:
+		content = ""
+	default:
+		encoded, _ := json.Marshal(v)
+		content = string(encoded)
+	}
+
+	calls := make([]ToolCall, 0, len(choice.Message.ToolCalls))
+	for _, tc := range choice.Message.ToolCalls {
+		args := map[string]interface{}{}
+		name := ""
+		if tc.Function != nil {
+			name = tc.Function.Name
+			if strings.TrimSpace(tc.Function.Arguments) != "" {
+				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+					args["raw"] = tc.Function.Arguments
+				}
+			}
+		}
+		calls = append(calls, ToolCall{ID: tc.ID, Type: tc.Type, Name: name, Arguments: args})
+	}
+
+	return &LLMResponse{
+		Content:      content,
+		ToolCalls:    calls,
+		FinishReason: choice.FinishReason,
+		Usage:        apiResponse.Usage,
+	}, nil
+}
